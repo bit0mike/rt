@@ -145,6 +145,126 @@ elsif (!$ShowHeaders)  {
 
 $m->callback(CallbackName => 'MassageDisplayHeaders', DisplayHeaders => \@DisplayHeaders, Transaction => $Transaction, ShowHeaders => $ShowHeaders);
 
+my $extract_cal_data;
+$extract_cal_data = sub {
+    # Notes on the VCALENDAR structure,
+    # primary sources: RFCs 5545, 5546
+    #   other RFCs may also apply
+
+    #VCALENDAR
+    # METHOD
+    #   PUBLISH (no interactivity, probably can be ignored)
+    #   REQUEST (interactive, looking for responses)
+    #   REPLY (a response, conveying status)
+    #   ADD (add instances to a recurring series)
+    #   CANCEL (cancel one or more instances)
+    #   REFRESH (used by an attendee to request an update, probably can be ignored)
+    #   COUNTER (used to propose alternate times, probably can be ignored)
+    #   DECLINECOUNTER (probably can be ignored)
+    # CALSCALE - should be absent or GREGORIAN
+
+    #VTIMEZONE
+    # use https://metacpan.org/pod/DateTime::TimeZone::ICal ?
+    # TZID - how it will be referred to later
+    # DAYLIGHT
+    #  DTSTART - irrelevant (start of timezone applicability?)
+    #  RDATE, RRULE, TZNAME, TZOFFSETFROM, TZOFFSETTO
+    # STANDARD
+    #  DTSTART - irrelevant (start of timezone applicability?)
+    #  RDATE, RRULE, TZNAME, TZOFFSETFROM, TZOFFSETTO
+
+    # N.B. I've never seen an invite with multiple VTIMEZONE records, but it's not against the standard.
+    #      Each non-UTC datetime MUST have a tzid, but because I've never seen more than one I'm
+    #      not bothering to look at it.  This might be a problem for interpreting some attachments.
+
+    #VEVENT
+    # DTSTAMP - last-modified date/time
+    # SEQUENCE - kind of like a DNS serial number
+    # ORGANIZER
+    #  CN - if present would be the name
+    # SUMMARY
+    # LOCATION
+    # DESCRIPTION
+    # RECURRENCE-ID - used when referring to a specific instance of a recurring event
+    # DTSTART
+    # DTEND / DURATION
+    # EXDATE - exceptions to the recurrence rule
+    # RDATE
+    # RRULE
+
+    my $into = shift; # hashref
+    my $entry = shift; # Data::ICal::Entry object
+    my $descr = shift || 'entry'; # used only in debugging
+    my $indent = shift || '';     # used only in debugging
+    my $parent_type = shift || undef;
+    my $i;
+
+    my $entry_type = $entry->ical_entry_type();
+
+    #$m->out( $indent . $descr . " type: " . $entry_type . "\n" );
+
+    my $properties = $entry->properties();
+
+    if ($entry_type eq 'VCALENDAR' and exists $properties->{method}) {
+        my $method = $properties->{method}[0]->value();
+
+        if ($method eq 'REQUEST') {
+            $into->{type} = loc('Meeting Invite');
+        }
+        elsif ($method eq 'CANCEL') {
+            $into->{type} = loc('Meeting Cancellation');
+        }
+    }
+    elsif ($entry_type eq 'VTIMEZONE' and exists $properties->{tzid}) {
+        $into->{timezone_name} = $properties->{tzid}[0]->value();
+    }
+    elsif ($parent_type and $parent_type eq 'VTIMEZONE' and $entry_type =~ /^(STANDARD|DAYLIGHT)$/ and exists $properties->{tzoffsetto}) {
+        my $offset_type = $1;
+
+        my $value = $properties->{tzoffsetto}[0]->value();
+        $value =~ s/(..)$/:$1/;
+        $value =~ s/(\D)0/$1/;
+        $value =~ s/:00$//;
+
+        $into->{timezone_offset}{$offset_type} = $value;
+    }
+    elsif ($entry_type eq 'VEVENT') {
+        foreach my $property_name (qw{organizer summary location description sequence dtstamp dtstart recurrence-id}) {
+            if (exists $properties->{$property_name}) {
+                $into->{$property_name} = $properties->{$property_name}[0]->value();
+            }
+        }
+
+        if (exists $properties->{rrule}) {
+            $into->{recurring} = 1;
+
+            if (exists $properties->{exdate}) {
+                $into->{exceptions} = 1;
+            }
+        }
+    }
+
+    #foreach my $prop_name ( sort keys %$properties ) {
+    #    $i = 0;
+    #    foreach my $prop ( @{ $properties->{$prop_name} } ) {
+    #        $m->out( $indent . "    " . $prop_name . "[" . $i++ . "] = " . $prop->value() . "\n" );
+    #        my $parameters = $prop->parameters();
+    #        if ($parameters and keys %$parameters) {
+    #            foreach my $param (sort keys %$parameters) {
+    #                $m->out( $indent . "      " . $param . " = " . $parameters->{$param} . "\n" );
+    #            }
+    #        }
+    #    }
+    #}
+
+    my $subentries = $entry->entries;
+
+    $i = 0;
+    foreach my $subentry (@$subentries) {
+        $extract_cal_data->( $into, $subentry, $descr . "[" . $i++ . "]", $indent . "        ", $entry_type );
+    }
+};
+
 my $render_attachment = sub {
     my $message = shift;
     my $name = defined $message->Filename && length $message->Filename ?  $message->Filename : '';
@@ -160,9 +280,138 @@ my $render_attachment = sub {
         $disposition = 'inline';
     }
 
+    my $max_size = RT->Config->Get( 'MaxInlineBody', $session{'CurrentUser'} );
+
+    if ( $content_type eq 'text/calendar' ) {
+        require Data::ICal;
+
+        # A named attachment will already have a download button
+        if (not $name) {
+            $m->out('<div class="downloadattachment">');
+            if (my $url = RT->System->ExternalStorageURLFor($message)) {
+                $m->out('<a href="' . $url . '"');
+            }
+            else {
+                $m->out('<a href="' . $AttachmentPath . '/' . $Transaction->Id . '/' . $message->Id . '/meeting.ics' . '" target="_blank"');
+            }
+            my $download_alt = loc( 'Download Meeting Invite' );
+            $m->out('alt="' . $download_alt . '" data-toggle="tooltip" data-placement="bottom" data-original-title="' . $download_alt . '">');
+            $m->out('<span class="fas fa-paperclip fa-2x"></span>');
+            $m->out('<span class="downloadfilename">meeting.ics</span>');
+            $m->out('</a>');
+            $m->out('</div>');
+        }
+
+        if ( $disposition ne 'inline' ) {
+            $m->out('<p>'. loc( 'Calendar invite is not shown because sender requested not to inline it.' ) .'</p>');
+            return;
+        }
+        elsif ( $max_size && $message->ContentLength > $max_size ) {
+            $m->out('<p>'. loc( 'Calendar invite is not shown because it is too large.' ) .'</p>');
+            return;
+        }
+
+        my $content;
+        # If we've cached the content, use it from there
+        if (my $x = $AttachmentContent->{ $Transaction->id }->{$message->id}) {
+            $content = $x->Content;
+        }
+        else {
+            $content = $message->Content;
+        }
+
+        my $cal_item = Data::ICal->new(data => $content);
+
+        if ( ref $cal_item and $cal_item->isa( 'Data::ICal::Entry' )) {
+            local $Data::Dumper::Sortkeys = 1;
+            local $Data::Dumper::Indent = 2;
+
+            my %calendar_info = (
+                location => loc('not given'),
+                sequence => 0,
+                type     => loc('Calendar Attachmet'),
+            );
+
+            $extract_cal_data->( \%calendar_info, $cal_item, 'Top Level Entry' );
+
+            if (exists $calendar_info{timezone_name}) {
+                my $offsets = join( '/', grep { defined $_ } @{$calendar_info{timezone_offset}}{ qw(STANDARD DAYLIGHT) } );
+
+                if ($offsets) {
+                    $calendar_info{timezone_text} = "$calendar_info{timezone_name} (UTC $offsets)";
+                }
+                else {
+                    $calendar_info{timezone_text} = $calendar_info{timezone_name};
+                }
+            }
+
+            foreach my $datetime ( qw(dtstamp dtstart) ) {
+                # dates with a trailing 'Z' actually are in UTC while the other dates are in some
+                # other timezine and the best we can do is to use their values unmodified, which
+                # is most easily accomplished by using UTC.
+
+                next unless exists $calendar_info{$datetime};
+
+                my $date = RT::Date->new( $session{'CurrentUser'} );
+                $date->Set(Format => 'iso', Value => $calendar_info{$datetime}, Timezone => 'UTC');
+
+                if ($calendar_info{$datetime} =~ /Z$/) {
+                    # explicitly in UTC, so we know when it is, so go ahead and present it in the user's timezone
+                    $calendar_info{$datetime} = $date->AsString();
+                }
+                else {
+                    $calendar_info{$datetime} = $date->AsString( Timezone => 'UTC' ) . ' ' . ($calendar_info{timezone_text} || loc("unknown timezone"));
+                }
+            }
+
+            if ($calendar_info{organizer}) {
+                $calendar_info{organizer} =~ s/^MAILTO://;
+            }
+
+            $m->out('<table><tbody>');
+            $m->out('<tr>');
+            $m->out('<td align="right" class="message-header-key">' . $calendar_info{type} . '</td>');
+            $m->out('<td class="message-header-value">');
+            if ($calendar_info{recurring}) {
+                $m->out(loc('Recurring'));
+                if ($calendar_info{exceptions}) {
+                    $m->out(' ' . loc('with exceptions'));
+                }
+            }
+            $m->out('</td>');
+            $m->out('</tr>');
+            $m->out('<tr>');
+            $m->out('<td align="right" class="message-header-key">From:</td>');
+            $m->out('<td class="message-header-value">' . $calendar_info{organizer} . '</td>');
+            $m->out('</tr>');
+            $m->out('<div class="message-stanza">');
+            $m->out('<td align="right" class="message-header-key">Last Modified:</td>');
+            $m->out('<td class="message-header-value">' . $calendar_info{dtstamp} . '</td>');
+            $m->out('</tr>');
+            $m->out('<div class="message-stanza">');
+            $m->out('<td align="right" class="message-header-key">Subject:</td>');
+            $m->out('<td class="message-header-value">' . $calendar_info{summary} . '</td>');
+            $m->out('</tr>');
+            $m->out('<div class="message-stanza">');
+            $m->out('<td align="right" class="message-header-key">Location:</td>');
+            $m->out('<td class="message-header-value">' . $calendar_info{location} . '</td>');
+            $m->out('</tr>');
+            $m->out('<div class="message-stanza">');
+            $m->out('<td align="right" class="message-header-key">Starting:</td>');
+            $m->out('<td class="message-header-value">' . $calendar_info{dtstart} . '</td>');
+            $m->out('</tr>');
+            $m->out('</tbody></table>');
+            $m->out('<div class="messagebody">');
+            $m->out(q{<div class="message-stanza-folder closed" onclick="fold_message_stanza(this, 'Show\x20full\x20description', 'Hide\x20full\x20description');">Show full description</div>});
+            $m->out(qq{<div class="message-stanza closed"><div class="message-stanza plain-text-white-space">$calendar_info{description}</div></div>});
+            $m->out('</div>');
+        }
+
+        return;
+    }
+
     # If it's text
-    if ( $content_type =~ m{^(text|message)/} ) {
-        my $max_size = RT->Config->Get( 'MaxInlineBody', $session{'CurrentUser'} );
+    elsif ( $content_type =~ m{^(text|message)/} ) {
         if ( $disposition ne 'inline' ) {
             $m->out('<p>'. loc( 'Message body is not shown because sender requested not to inline it.' ) .'</p>');
             return;
